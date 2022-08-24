@@ -12,7 +12,8 @@ import (
 	"k8s.io/utils/strings/slices"
 
 	pb "github.com/cilium/cilium/api/v1/flow"
-	"github.com/cilium/cilium/pkg/labels"
+	k8sConst "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
+	ciliumLabels "github.com/cilium/cilium/pkg/labels"
 )
 
 // ContextIdentifier describes the identification method of a transmission or
@@ -43,14 +44,40 @@ const (
 
 // ContextOptionsHelp is the help text for context options
 const ContextOptionsHelp = `
- sourceContext          := identifier , { "|", identifier }
- destinationContext     := identifier , { "|", identifier }
- identifier             := identity | namespace | pod | pod-short | dns | ip | reserved-identity
+ sourceContext          ::= identifier , { "|", identifier }
+ destinationContext     ::= identifier , { "|", identifier }
+ labels                 ::= label , { ",", label }
+ identifier             ::= identity | namespace | pod | pod-short | dns | ip | reserved-identity
+ label                  ::= source_pod | source_namespace | source_workload | source_app | destination_pod | destination_namespace | destination_workload | destination_app | reporter
 `
 
 var (
 	shortPodPattern    = regexp.MustCompile("^(.+?)(-[a-z0-9]+){1,2}$")
-	kubeAPIServerLabel = labels.LabelKubeAPIServer.String()
+	kubeAPIServerLabel = ciliumLabels.LabelKubeAPIServer.String()
+	// contextLabelsList defines available labels for the ContextLabels
+	// ContextIdentifier and the order of those labels for GetLabelNames and GetLabelValues.
+	contextLabelsList = []string{
+		"source_pod",
+		"source_namespace",
+		"source_workload",
+		"source_app",
+		"destination_pod",
+		"destination_namespace",
+		"destination_workload",
+		"destination_app",
+		"reporter",
+	}
+	allowedContextLabels = newLabelsSet(contextLabelsList)
+
+	podAppLabels = []string{
+		// k8s recommend app label
+		ciliumLabels.LabelSourceK8sKeyPrefix + k8sConst.AppKubernetes + "/name",
+		// legacy k8s app label
+		ciliumLabels.LabelSourceK8sKeyPrefix + "k8s-app",
+		// app label that is often used before people realize there's a recommended
+		// label
+		ciliumLabels.LabelSourceK8sKeyPrefix + "app",
+	}
 )
 
 // String return the context identifier as string
@@ -72,7 +99,6 @@ func (c ContextIdentifier) String() string {
 		return "ip"
 	case ContextReservedIdentity:
 		return "reserved-identity"
-
 	}
 	return fmt.Sprintf("%d", c)
 }
@@ -94,6 +120,10 @@ type ContextOptions struct {
 	Destination ContextIdentifierList
 	// Source is the source context to include in metrics
 	Source ContextIdentifierList
+
+	// Labels is the full set of labels that have been allowlisted when using the
+	// ContextLabels ContextIdentifier.
+	Labels labelsSet
 }
 
 func parseContextIdentifier(s string) (ContextIdentifier, error) {
@@ -129,28 +159,121 @@ func parseContext(s string) (cs ContextIdentifierList, err error) {
 	return cs, nil
 }
 
+func parseLabels(s string) (labelsSet, error) {
+	labels := strings.Split(s, ",")
+	for _, label := range labels {
+		if !allowedContextLabels.HasLabel(label) {
+			return labelsSet{}, fmt.Errorf("invalid labelsContext value: %s", label)
+		}
+	}
+	ls := newLabelsSet(labels)
+	return ls, nil
+}
+
 // ParseContextOptions parses a set of options and extracts the context
 // relevant options
 func ParseContextOptions(options Options) (*ContextOptions, error) {
 	o := &ContextOptions{}
+	var err error
 	for key, value := range options {
 		switch strings.ToLower(key) {
 		case "destinationcontext":
-			c, err := parseContext(value)
+			o.Destination, err = parseContext(value)
 			if err != nil {
 				return nil, err
 			}
-			o.Destination = c
 		case "sourcecontext":
-			c, err := parseContext(value)
+			o.Source, err = parseContext(value)
 			if err != nil {
 				return nil, err
 			}
-			o.Source = c
+		case "labelscontext":
+			o.Labels, err = parseLabels(value)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
 	return o, nil
+}
+
+type labelsSet map[string]struct{}
+
+func newLabelsSet(labels []string) labelsSet {
+	m := make(map[string]struct{}, len(labels))
+	for _, label := range labels {
+		m[label] = struct{}{}
+	}
+	return labelsSet(m)
+}
+
+func (ls labelsSet) HasLabel(label string) bool {
+	_, exists := ls[label]
+	return exists
+}
+
+func labelsContext(wantedLabels labelsSet, flow *pb.Flow) (outputLabels []string) {
+	// Iterate over contextLabelsList so that the label order is stable,
+	// otherwise GetLabelNames and GetLabelValues might be mismatched
+	for _, label := range contextLabelsList {
+		if wantedLabels.HasLabel(label) {
+			var labelValue string
+			switch label {
+			case "source_pod":
+				if flow.GetSource() != nil {
+					labelValue = flow.GetSource().PodName
+				}
+			case "source_namespace":
+				if flow.GetSource() != nil {
+					labelValue = flow.GetSource().Namespace
+				}
+			case "source_workload":
+				if flow.GetSource() != nil {
+					if workloads := flow.GetSource().GetWorkloads(); len(workloads) != 0 {
+						labelValue = workloads[0].Name
+					}
+				}
+			case "source_app":
+				if flow.GetSource() != nil {
+					labelValue = getK8sAppFromLabels(flow.GetSource().GetLabels())
+				}
+			case "destination_pod":
+				if flow.GetDestination() != nil {
+					labelValue = flow.GetDestination().PodName
+				}
+			case "destination_namespace":
+				if flow.GetDestination() != nil {
+					labelValue = flow.GetDestination().Namespace
+				}
+			case "destination_workload":
+				if flow.GetDestination() != nil {
+					if workloads := flow.GetDestination().GetWorkloads(); len(workloads) != 0 {
+						labelValue = workloads[0].Name
+					}
+				}
+			case "destination_app":
+				if flow.GetDestination() != nil {
+					labelValue = getK8sAppFromLabels(flow.GetDestination().GetLabels())
+				}
+			case "reporter":
+				switch flow.GetTrafficDirection() {
+				case pb.TrafficDirection_EGRESS:
+					labelValue = "client"
+				case pb.TrafficDirection_INGRESS:
+					labelValue = "server"
+				default:
+					labelValue = "unknown"
+				}
+			default:
+				// Label is in contextLabelsList but isn't handled the switch
+				// statement. Programmer error.
+				panic(fmt.Sprintf("label %s not mapped in labelsContext, please update labelsContext", label))
+			}
+			outputLabels = append(outputLabels, labelValue)
+		}
+	}
+	return outputLabels
 }
 
 func sourceNamespaceContext(flow *pb.Flow) (context string) {
@@ -226,7 +349,7 @@ func handleReservedIdentityLabels(lbls []string) string {
 	}
 	// else return the first reserved label.
 	for _, label := range lbls {
-		if strings.HasPrefix(label, labels.LabelSourceReserved+":") {
+		if strings.HasPrefix(label, ciliumLabels.LabelSourceReserved+":") {
 			return label
 		}
 	}
@@ -281,10 +404,26 @@ func destinationIPContext(flow *pb.Flow) (context string) {
 	return
 }
 
+func getK8sAppFromLabels(labels []string) string {
+	ls := ciliumLabels.ParseLabelArrayFromArray(labels)
+	// iterate over the set of pod app labels we source from and return the first
+	// app label that is non-empty.
+	for _, label := range podAppLabels {
+		if labelValue := ls.Get(label); labelValue != "" {
+			return labelValue
+		}
+	}
+	return ""
+}
+
 // GetLabelValues returns the values of the context relevant labels according
 // to the configured options. The order of the values is the same as the order
 // of the label names returned by GetLabelNames()
 func (o *ContextOptions) GetLabelValues(flow *pb.Flow) (labels []string) {
+	if len(o.Labels) != 0 {
+		labels = append(labels, labelsContext(o.Labels, flow)...)
+	}
+
 	if len(o.Source) != 0 {
 		var context string
 		for _, source := range o.Source {
@@ -345,6 +484,16 @@ func (o *ContextOptions) GetLabelValues(flow *pb.Flow) (labels []string) {
 // GetLabelNames returns a slice of label names required to fulfil the
 // configured context description requirements
 func (o *ContextOptions) GetLabelNames() (labels []string) {
+	if len(o.Labels) != 0 {
+		// We must iterate over contextLabelsList to ensure the order of the label
+		// names the same order as label values in GetLabelValues
+		for _, label := range contextLabelsList {
+			if o.Labels.HasLabel(label) {
+				labels = append(labels, label)
+			}
+		}
+	}
+
 	if len(o.Source) != 0 {
 		labels = append(labels, "source")
 	}

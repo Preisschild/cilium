@@ -530,6 +530,29 @@ and use the IP address of the target instead.
 
    In all of these 3 cases, ``reserved-identity`` context returns ``reserved:kube-apiserver``.
 
+Hubble metrics can also be configured with a ``labelsContext`` which allows providing a list of labels
+that should be added to the metric. Unlike ``sourceContext`` and ``destinationContext``, instead
+of different values being put into the same metric label, the ``labelsContext`` puts them into different label values.
+
+========================= ===============================================================================
+Option Value              Description
+========================= ===============================================================================
+``source_namespace``      The namespace of the pod if the flow source is from a Kubernetes pod.
+``source_pod``            The pod name of the pod if the flow source is from a Kubernetes pod.
+``source_workload``       The name of the source pod's workload (Deployment, Statefulset, Daemonset, ReplicationController).
+``source_app``            The app name of the source pod, derived from pod labels (``app.kubernetes.io/name``, ``k8s-app``, or ``app``).
+``destination_namespace`` The namespace of the pod if the flow destination is from a Kubernetes pod.
+``destination_pod``       The pod name of the pod if the flow destination is from a Kubernetes pod.
+``destination_workload``  The name of the destination pod's workload (Deployment, Statefulset, Daemonset, ReplicationController).
+``destination_app``       The app name of the source pod, derived from pod labels (``app.kubernetes.io/name``, ``k8s-app``, or ``app``).
+``reporter``              Identifies the origin of the flow/request. It is set to ``source`` if it originated from the client, and ``destination`` if it originated from the server.
+========================= ===============================================================================
+
+When specifying the flow context, multiple values can be specified by separating them via the ``,`` symbol.
+All labels listed are included in the metric, even if empty. For example, a metric configuration of
+``http:labelsContext=source_namespace,source_pod`` will add the ``source_namespace`` and ``source_pod``
+labels to all Hubble http metrics.
+
 .. _hubble_exported_metrics:
 
 Exported Metrics
