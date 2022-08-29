@@ -6,6 +6,7 @@ package http
 import (
 	"context"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -19,32 +20,52 @@ type httpHandler struct {
 	responses *prometheus.CounterVec
 	duration  *prometheus.HistogramVec
 	context   *api.ContextOptions
+	useV2     bool
 }
 
 func (h *httpHandler) Init(registry *prometheus.Registry, options api.Options) error {
+	if useV2, ok := options["useV2"]; ok && strings.ToLower(useV2) == "true" {
+		h.useV2 = true
+	}
 	c, err := api.ParseContextOptions(options)
 	if err != nil {
 		return err
 	}
 	h.context = c
-	h.requests = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: api.DefaultPrometheusNamespace,
-		Name:      "http_requests_total",
-		Help:      "Count of HTTP requests",
-	}, append(h.context.GetLabelNames(), "method", "protocol"))
-	h.responses = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: api.DefaultPrometheusNamespace,
-		Name:      "http_responses_total",
-		Help:      "Count of HTTP responses",
-	}, append(h.context.GetLabelNames(), "status", "method"))
-	h.duration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: api.DefaultPrometheusNamespace,
-		Name:      "http_request_duration_seconds",
-		Help:      "Quantiles of HTTP request duration in seconds",
-	}, append(h.context.GetLabelNames(), "method"))
-	registry.MustRegister(h.requests)
-	registry.MustRegister(h.responses)
-	registry.MustRegister(h.duration)
+
+	if h.useV2 {
+		h.requests = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: api.DefaultPrometheusNamespace,
+			Name:      "http_requests_total",
+			Help:      "Count of HTTP requests",
+		}, append(h.context.GetLabelNames(), "method", "protocol", "status"))
+		h.duration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: api.DefaultPrometheusNamespace,
+			Name:      "http_request_duration_seconds",
+			Help:      "Quantiles of HTTP request duration in seconds",
+		}, append(h.context.GetLabelNames(), "method"))
+		registry.MustRegister(h.requests)
+		registry.MustRegister(h.duration)
+	} else {
+		h.requests = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: api.DefaultPrometheusNamespace,
+			Name:      "http_requests_total",
+			Help:      "Count of HTTP requests",
+		}, append(h.context.GetLabelNames(), "method", "protocol"))
+		h.responses = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: api.DefaultPrometheusNamespace,
+			Name:      "http_responses_total",
+			Help:      "Count of HTTP responses",
+		}, append(h.context.GetLabelNames(), "status", "method"))
+		h.duration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: api.DefaultPrometheusNamespace,
+			Name:      "http_request_duration_seconds",
+			Help:      "Quantiles of HTTP request duration in seconds",
+		}, append(h.context.GetLabelNames(), "method"))
+		registry.MustRegister(h.requests)
+		registry.MustRegister(h.responses)
+		registry.MustRegister(h.duration)
+	}
 	return nil
 }
 
@@ -64,12 +85,23 @@ func (h *httpHandler) ProcessFlow(ctx context.Context, flow *flowpb.Flow) {
 	if http == nil {
 		return
 	}
-	labelValues := h.context.GetLabelValues(flow)
-	if l7.Type == flowpb.L7FlowType_REQUEST {
-		h.requests.WithLabelValues(append(labelValues, http.Method, http.Protocol)...).Inc()
-	} else if l7.Type == flowpb.L7FlowType_RESPONSE {
+	if h.useV2 {
+		if l7.Type != flowpb.L7FlowType_RESPONSE {
+			return
+		}
+		labelValues := h.context.GetLabelValuesInvertSourceDestination(flow)
 		status := strconv.Itoa(int(http.Code))
-		h.responses.WithLabelValues(append(labelValues, status, http.Method)...).Inc()
+		h.requests.WithLabelValues(append(labelValues, http.Method, http.Protocol, status)...).Inc()
 		h.duration.WithLabelValues(append(labelValues, http.Method)...).Observe(float64(l7.LatencyNs) / float64(time.Second))
+	} else {
+		labelValues := h.context.GetLabelValues(flow)
+		switch l7.Type {
+		case flowpb.L7FlowType_REQUEST:
+			h.requests.WithLabelValues(append(labelValues, http.Method, http.Protocol)...).Inc()
+		case flowpb.L7FlowType_RESPONSE:
+			status := strconv.Itoa(int(http.Code))
+			h.responses.WithLabelValues(append(labelValues, status, http.Method)...).Inc()
+			h.duration.WithLabelValues(append(labelValues, http.Method)...).Observe(float64(l7.LatencyNs) / float64(time.Second))
+		}
 	}
 }
