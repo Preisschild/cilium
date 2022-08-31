@@ -484,7 +484,7 @@ ingressController:
   # -- IngressLBAnnotations are the annotations which are needed to propagate
   # from Ingress to the Load Balancer
   ingressLBAnnotations: ['service.beta.kubernetes.io', 'service.kubernetes.io', 'cloud.google.com']
-  
+
   # -- SecretsNamespace is the namespace in which envoy SDS will retrieve TLS secrets from.
   secretsNamespace:
     # -- Create secrets namespace for Ingress.
@@ -700,6 +700,11 @@ hubble:
       annotations: {}
       # -- Interval for scrape metrics.
       interval: "10s"
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      annotations: {}
 
   # -- Unix domain socket path to listen to when Hubble is enabled.
   socketPath: /var/run/cilium/hubble.sock
